@@ -449,19 +449,29 @@ R"(
            always output image quality metrics and compression time but
            will suppress all other output.
 
+       -mipmaps
+           Generate a full mipmap chain using a 2x2 box filter and
+           compress each level. Output must be .ktx format. Each level
+           uses the same compression settings. When combined with
+           -guide-out or -guide-in, one guide file per level is used
+           with a .<level> suffix (e.g., out.guide.0, out.guide.1).
+
        -guide-out <path>
            After compression, write a guide sidecar file to <path>. The
            guide captures per-block structural decisions (block mode,
            partition count, partition index) that enable fast guided
            recompression from the original image. The guide does not
-           contain any pixel-derived data.
+           contain any pixel-derived data. When used with -mipmaps, one
+           guide file per mipmap level is written with a .<level> suffix.
 
        -guide-in <path>
            Use a guide file for guided compression. Instead of searching
            for block modes and partitions, the encoder reads these from
            the guide and only re-derives endpoints and weights. This is
            50-200x faster than full compression. The guide must have been
-           generated from the same image (verified by checksum).)"
+           generated from the same image (verified by checksum). When
+           used with -mipmaps, guide files are loaded per level; missing
+           level guides fall back to normal compression.)"
 // This split in the literals is needed for Visual Studio; the compiler
 // will concatenate these two strings together ...
 R"(

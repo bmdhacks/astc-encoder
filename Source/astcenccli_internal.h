@@ -101,6 +101,9 @@ struct cli_config_options
 
 	/** @brief The file path for guide input (empty if not used). */
 	std::string guide_in_filename;
+
+	/** @brief @c true if a full mipmap chain should be generated. */
+	bool generate_mipmaps;
 };
 
 /**
@@ -210,6 +213,19 @@ void free_image(
 	astcenc_image* img);
 
 /**
+ * @brief Generate the next mipmap level from a source image using a 2x2 box filter.
+ *
+ * Output dimensions are max(1, src->dim_x / 2) x max(1, src->dim_y / 2) x 1.
+ * Supports U8, F16, and F32 data types.
+ *
+ * @param src   The source image.
+ *
+ * @return The downscaled image, allocated with alloc_image(). Caller must free with free_image().
+ */
+astcenc_image* generate_mipmap_image(
+	const astcenc_image* src);
+
+/**
  * @brief Determine the number of active components in an image.
  *
  * @param img   The image to analyze.
@@ -263,11 +279,30 @@ bool load_ktx_compressed_image(
  * @param img        The image to store.
  * @param filename   The file to store.
  * @param is_srgb    Is this an sRGB encoded file?
+ * @param y_flip     Should the image be vertically flipped?
  *
  * @return Non-zero on error, zero on success.
  */
 bool store_ktx_compressed_image(
 	const astc_compressed_image& img,
+	const char* filename,
+	bool is_srgb,
+	bool y_flip);
+
+/**
+ * @brief Store a multi-level compressed .ktx image with mipmaps.
+ *
+ * @param levels       Array of compressed images, one per mipmap level (0 = base).
+ * @param level_count  The number of mipmap levels.
+ * @param filename     The file to store.
+ * @param is_srgb      Is this an sRGB encoded file?
+ * @param y_flip       Should the image be vertically flipped?
+ *
+ * @return Non-zero on error, zero on success.
+ */
+bool store_ktx_compressed_image(
+	const astc_compressed_image* levels,
+	unsigned int level_count,
 	const char* filename,
 	bool is_srgb,
 	bool y_flip);

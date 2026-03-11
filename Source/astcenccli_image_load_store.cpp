@@ -1505,6 +1505,89 @@ bool store_ktx_compressed_image(
 	return false;
 }
 
+/* See header for documentation. */
+bool store_ktx_compressed_image(
+	const astc_compressed_image* levels,
+	unsigned int level_count,
+	const char* filename,
+	bool is_srgb,
+	bool y_flip
+) {
+	unsigned int fmt = get_format(levels[0].block_x, levels[0].block_y, levels[0].block_z, is_srgb);
+
+	ktx_header hdr;
+	memcpy(hdr.magic, ktx_magic, 12);
+	hdr.endianness = 0x04030201;
+	hdr.gl_type = 0;
+	hdr.gl_type_size = 1;
+	hdr.gl_format = 0;
+	hdr.gl_internal_format = fmt;
+	hdr.gl_base_internal_format = GL_RGBA;
+	hdr.pixel_width = levels[0].dim_x;
+	hdr.pixel_height = levels[0].dim_y;
+	hdr.pixel_depth = (levels[0].dim_z == 1) ? 0 : levels[0].dim_z;
+	hdr.number_of_array_elements = 0;
+	hdr.number_of_faces = 1;
+	hdr.number_of_mipmap_levels = level_count;
+
+	// Calculate size of KTX orientation metadata
+	const char* orientation_value = y_flip ? "S=r,T=u" : "S=r,T=d";
+	hdr.bytes_of_key_value_data = ktx_keyvalue_size("KTXorientation", orientation_value);
+
+#if defined(ASTCENC_BIG_ENDIAN)
+	ktx_header_switch_endianness(&hdr);
+#endif
+
+	// Calculate expected file size
+	size_t expected = sizeof(ktx_header) + hdr.bytes_of_key_value_data;
+	for (unsigned int i = 0; i < level_count; i++)
+	{
+		size_t padded = (levels[i].data_len + 3) & ~static_cast<size_t>(3);
+		expected += 4 + padded;
+	}
+
+	size_t actual = 0;
+
+	FILE *wf = fopen(filename, "wb");
+	if (!wf)
+	{
+		return true;
+	}
+
+	actual += fwrite(&hdr, 1, sizeof(ktx_header), wf);
+
+	// Write KTX orientation metadata
+	actual += write_ktx_keyvalue(wf, "KTXorientation", orientation_value);
+
+	// Write each mipmap level
+	for (unsigned int i = 0; i < level_count; i++)
+	{
+		uint32_t data_len = static_cast<uint32_t>(levels[i].data_len);
+#if defined(ASTCENC_BIG_ENDIAN)
+		data_len = reverse_bytes_u32(data_len);
+#endif
+		actual += fwrite(&data_len, 1, sizeof(uint32_t), wf);
+		actual += fwrite(levels[i].data, 1, levels[i].data_len, wf);
+
+		// Pad to 4-byte alignment
+		size_t padding = ((levels[i].data_len + 3) & ~static_cast<size_t>(3)) - levels[i].data_len;
+		if (padding > 0)
+		{
+			uint8_t pad[3] = { 0, 0, 0 };
+			actual += fwrite(pad, 1, padding, wf);
+		}
+	}
+
+	fclose(wf);
+
+	if (actual != expected)
+	{
+		return true;
+	}
+
+	return false;
+}
+
 /**
  * @brief Save a KTX uncompressed image using a local store routine.
  *

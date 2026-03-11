@@ -942,6 +942,11 @@ static int edit_astcenc_config(
 		{
 			argidx++;
 		}
+		else if (!strcmp(argv[argidx], "-mipmaps"))
+		{
+			argidx++;
+			cli_config.generate_mipmaps = true;
+		}
 		else if (!strcmp(argv[argidx], "-blockmodelimit"))
 		{
 			argidx += 2;
@@ -2028,7 +2033,7 @@ int astcenc_main(
 	cli_config_options cli_config { 0, 1, 1, false, false, false, -10, 10,
 		{ ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A },
 		{ ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A },
-		{}, {} };
+		{}, {}, false };
 
 	error = edit_astcenc_config(argc, argv, operation, cli_config, config);
 	if (error)
@@ -2104,6 +2109,12 @@ int astcenc_main(
 			print_error("ERROR: Unknown compressed output file type '%s'\n", eptr);
 			return 1;
 		}
+
+		if (cli_config.generate_mipmaps && !ends_with(output_filename, ".ktx"))
+		{
+			print_error("ERROR: -mipmaps requires .ktx output format\n");
+			return 1;
+		}
 	}
 
 	codec_status = astcenc_context_alloc(&config, cli_config.thread_count, &codec_context);
@@ -2174,6 +2185,12 @@ int astcenc_main(
 			}
 			printf("    Components:                 %d\n\n", image_uncomp_in_component_count);
 		}
+
+		if (cli_config.generate_mipmaps && image_uncomp_in->dim_z > 1)
+		{
+			print_error("ERROR: -mipmaps is not supported for 3D/volumetric images\n");
+			return 1;
+		}
 	}
 
 	double image_size = 0.0;
@@ -2193,244 +2210,302 @@ int astcenc_main(
 	// Compress an image
 	double best_compression_time = 100000.0;
 	double total_compression_time = 0.0;
+	std::vector<astc_compressed_image> mip_compressed;
+	std::vector<astcenc_image*> mip_images;
 	if (operation & ASTCENC_STAGE_COMPRESS)
 	{
 		print_astcenc_config(cli_config, config);
 
-		unsigned int blocks_x = (image_uncomp_in->dim_x + config.block_x - 1) / config.block_x;
-		unsigned int blocks_y = (image_uncomp_in->dim_y + config.block_y - 1) / config.block_y;
-		unsigned int blocks_z = (image_uncomp_in->dim_z + config.block_z - 1) / config.block_z;
-		size_t buffer_size = blocks_x * blocks_y * blocks_z * 16;
-		uint8_t* buffer = new uint8_t[buffer_size];
-
-		// Guided compression path
-		if (!cli_config.guide_in_filename.empty())
+		// Build mipmap chain of source images
+		mip_images.push_back(image_uncomp_in);
+		if (cli_config.generate_mipmaps)
 		{
-			// Load guide file
-			FILE* guide_file = fopen(cli_config.guide_in_filename.c_str(), "rb");
-			if (!guide_file)
+			astcenc_image* current = image_uncomp_in;
+			while (current->dim_x > 1 || current->dim_y > 1)
 			{
-				print_error("ERROR: Failed to open guide file '%s'\n", cli_config.guide_in_filename.c_str());
-				delete[] buffer;
-				return 1;
-			}
-
-			fseek(guide_file, 0, SEEK_END);
-			size_t guide_len = static_cast<size_t>(ftell(guide_file));
-			fseek(guide_file, 0, SEEK_SET);
-
-			uint8_t* guide_data = new uint8_t[guide_len];
-			size_t read_count = fread(guide_data, 1, guide_len, guide_file);
-			fclose(guide_file);
-
-			if (read_count != guide_len)
-			{
-				print_error("ERROR: Failed to read guide file '%s'\n", cli_config.guide_in_filename.c_str());
-				delete[] guide_data;
-				delete[] buffer;
-				return 1;
+				current = generate_mipmap_image(current);
+				mip_images.push_back(current);
 			}
 
 			if (!cli_config.silentmode)
 			{
-				printf("Guided compression using '%s'\n\n", cli_config.guide_in_filename.c_str());
-			}
-
-			double start_compression_time = get_time();
-			astcenc_swizzle swz = cli_config.swz_encode;
-			astcenc_error guide_error = astcenc_compress_image_guided(
-				codec_context, image_uncomp_in, &swz,
-				guide_data, guide_len,
-				buffer, buffer_size, 0);
-
-			total_compression_time = get_time() - start_compression_time;
-			best_compression_time = total_compression_time;
-
-			if (guide_error == ASTCENC_ERR_BAD_GUIDE)
-			{
-				// Diagnose the specific mismatch reason before freeing guide_data
-				auto rle32 = [](const uint8_t* p) -> uint32_t {
-					return uint32_t(p[0]) | (uint32_t(p[1]) << 8)
-					     | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
-				};
-
-				char reason[256];
-				if (guide_len < 24)
+				printf("Mipmap chain\n");
+				printf("============\n\n");
+				for (size_t i = 0; i < mip_images.size(); i++)
 				{
-					snprintf(reason, sizeof(reason),
-					         "file too small (corrupt or truncated)");
+					printf("    Mip %zu: %ux%u\n",
+					       i, mip_images[i]->dim_x, mip_images[i]->dim_y);
 				}
-				else if (rle32(guide_data) != 0x44475341u)
-				{
-					snprintf(reason, sizeof(reason),
-					         "not a guide file (bad magic number)");
-				}
-				else if (guide_data[4] != 1)
-				{
-					snprintf(reason, sizeof(reason),
-					         "incompatible guide version (guide has v%u, expected v1)",
-					         unsigned(guide_data[4]));
-				}
-				else if (guide_data[5] != config.block_x ||
-				         guide_data[6] != config.block_y ||
-				         guide_data[7] != config.block_z)
-				{
-					snprintf(reason, sizeof(reason),
-					         "block size mismatch (guide has %ux%u, encoding uses %ux%u)",
-					         unsigned(guide_data[5]), unsigned(guide_data[6]),
-					         config.block_x, config.block_y);
-				}
-				else if (rle32(guide_data + 8) != image_uncomp_in->dim_x ||
-				         rle32(guide_data + 12) != image_uncomp_in->dim_y ||
-				         rle32(guide_data + 16) != image_uncomp_in->dim_z)
-				{
-					snprintf(reason, sizeof(reason),
-					         "image dimensions mismatch (guide has %ux%u, image is %ux%u)",
-					         rle32(guide_data + 8), rle32(guide_data + 12),
-					         image_uncomp_in->dim_x, image_uncomp_in->dim_y);
-				}
-				else
-				{
-					snprintf(reason, sizeof(reason),
-					         "image content changed (checksum mismatch)");
-				}
-
-				printf("WARNING: Guide '%s' does not match input '%s': %s\n",
-				       cli_config.guide_in_filename.c_str(),
-				       input_filename.c_str(), reason);
-				printf("         Falling back to normal compression\n");
-				delete[] guide_data;
-				astcenc_compress_reset(codec_context);
-				goto normal_compress;
-			}
-
-			delete[] guide_data;
-
-			if (guide_error != ASTCENC_SUCCESS)
-			{
-				print_error("ERROR: Guided compress failed: %s\n", astcenc_get_error_string(guide_error));
-				delete[] buffer;
-				if (operation & ASTCENC_STAGE_ST_COMP)
-				{
-					remove(output_filename.c_str());
-				}
-				return 1;
+				printf("\n");
 			}
 		}
-		// Normal compression path
-		else
+
+		// Compress each mip level
+		double start_total_time = get_time();
+		for (size_t level = 0; level < mip_images.size(); level++)
 		{
-		normal_compress:
-			compression_workload work;
-			work.context = codec_context;
-			work.image = image_uncomp_in;
-			work.swizzle = cli_config.swz_encode;
-			work.data_out = buffer;
-			work.data_len = buffer_size;
-			work.error = ASTCENC_SUCCESS;
+			astcenc_image* mip_img = mip_images[level];
 
-			// Only launch worker threads for multi-threaded use - it makes basic
-			// single-threaded profiling and debugging a little less convoluted
-			double start_compression_time = get_time();
-			for (unsigned int i = 0; i < cli_config.repeat_count; i++)
+			unsigned int blocks_x = (mip_img->dim_x + config.block_x - 1) / config.block_x;
+			unsigned int blocks_y = (mip_img->dim_y + config.block_y - 1) / config.block_y;
+			unsigned int blocks_z = (mip_img->dim_z + config.block_z - 1) / config.block_z;
+			size_t buffer_size = blocks_x * blocks_y * blocks_z * 16;
+			uint8_t* buffer = new uint8_t[buffer_size];
+
+			bool used_guide = false;
+
+			// Guided compression path
+			if (!cli_config.guide_in_filename.empty())
 			{
-				if (config.progress_callback)
+				// Build per-level guide filename
+				std::string guide_path = cli_config.guide_in_filename;
+				if (cli_config.generate_mipmaps)
 				{
-					printf("Compression\n");
-					printf("===========\n");
-					printf("\n");
+					guide_path += "." + std::to_string(level);
 				}
 
-				double start_iter_time = get_time();
-				if (cli_config.thread_count > 1)
+				FILE* guide_file = fopen(guide_path.c_str(), "rb");
+				if (guide_file)
 				{
-					launch_threads("Compression", cli_config.thread_count, compression_workload_runner, &work);
+					fseek(guide_file, 0, SEEK_END);
+					size_t guide_len = static_cast<size_t>(ftell(guide_file));
+					fseek(guide_file, 0, SEEK_SET);
+
+					uint8_t* guide_data = new uint8_t[guide_len];
+					size_t read_count = fread(guide_data, 1, guide_len, guide_file);
+					fclose(guide_file);
+
+					if (read_count != guide_len)
+					{
+						print_error("ERROR: Failed to read guide file '%s'\n", guide_path.c_str());
+						delete[] guide_data;
+						delete[] buffer;
+						return 1;
+					}
+
+					if (!cli_config.silentmode)
+					{
+						printf("Guided compression for mip %zu using '%s'\n",
+						       level, guide_path.c_str());
+					}
+
+					astcenc_swizzle swz = cli_config.swz_encode;
+					astcenc_error guide_error = astcenc_compress_image_guided(
+						codec_context, mip_img, &swz,
+						guide_data, guide_len,
+						buffer, buffer_size, 0);
+
+					if (guide_error == ASTCENC_ERR_BAD_GUIDE)
+					{
+						auto rle32 = [](const uint8_t* p) -> uint32_t {
+							return uint32_t(p[0]) | (uint32_t(p[1]) << 8)
+							     | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+						};
+
+						char reason[256];
+						if (guide_len < 24)
+						{
+							snprintf(reason, sizeof(reason),
+							         "file too small (corrupt or truncated)");
+						}
+						else if (rle32(guide_data) != 0x44475341u)
+						{
+							snprintf(reason, sizeof(reason),
+							         "not a guide file (bad magic number)");
+						}
+						else if (guide_data[4] != 1)
+						{
+							snprintf(reason, sizeof(reason),
+							         "incompatible guide version (guide has v%u, expected v1)",
+							         unsigned(guide_data[4]));
+						}
+						else if (guide_data[5] != config.block_x ||
+						         guide_data[6] != config.block_y ||
+						         guide_data[7] != config.block_z)
+						{
+							snprintf(reason, sizeof(reason),
+							         "block size mismatch (guide has %ux%u, encoding uses %ux%u)",
+							         unsigned(guide_data[5]), unsigned(guide_data[6]),
+							         config.block_x, config.block_y);
+						}
+						else if (rle32(guide_data + 8) != mip_img->dim_x ||
+						         rle32(guide_data + 12) != mip_img->dim_y ||
+						         rle32(guide_data + 16) != mip_img->dim_z)
+						{
+							snprintf(reason, sizeof(reason),
+							         "image dimensions mismatch (guide has %ux%u, image is %ux%u)",
+							         rle32(guide_data + 8), rle32(guide_data + 12),
+							         mip_img->dim_x, mip_img->dim_y);
+						}
+						else
+						{
+							snprintf(reason, sizeof(reason),
+							         "image content changed (checksum mismatch)");
+						}
+
+						printf("WARNING: Guide '%s' does not match mip %zu: %s\n",
+						       guide_path.c_str(), level, reason);
+						printf("         Falling back to normal compression for this level\n");
+						delete[] guide_data;
+						astcenc_compress_reset(codec_context);
+					}
+					else if (guide_error != ASTCENC_SUCCESS)
+					{
+						print_error("ERROR: Guided compress failed: %s\n",
+						            astcenc_get_error_string(guide_error));
+						delete[] guide_data;
+						delete[] buffer;
+						return 1;
+					}
+					else
+					{
+						delete[] guide_data;
+						used_guide = true;
+						astcenc_compress_reset(codec_context);
+					}
 				}
-				else
+				else if (!cli_config.generate_mipmaps)
 				{
-					work.error = astcenc_compress_image(
-						work.context, work.image, &work.swizzle,
-						work.data_out, work.data_len, 0);
+					// Non-mipmap mode: missing guide is an error
+					print_error("ERROR: Failed to open guide file '%s'\n", guide_path.c_str());
+					delete[] buffer;
+					return 1;
 				}
-
-				astcenc_compress_reset(codec_context);
-
-				if (config.progress_callback)
+				else if (!cli_config.silentmode)
 				{
-					printf("\n\n");
+					printf("WARNING: Guide file '%s' not found, using normal compression for mip %zu\n",
+					       guide_path.c_str(), level);
 				}
-
-				double iter_time = get_time() - start_iter_time;
-				best_compression_time = astc::min(iter_time, best_compression_time);
 			}
-			total_compression_time = get_time() - start_compression_time;
 
-			if (work.error != ASTCENC_SUCCESS)
+			// Normal compression path (if guide not used)
+			if (!used_guide)
 			{
-				print_error("ERROR: Codec compress failed: %s\n", astcenc_get_error_string(work.error));
-				delete[] buffer;
-				return 1;
+				compression_workload work;
+				work.context = codec_context;
+				work.image = mip_img;
+				work.swizzle = cli_config.swz_encode;
+				work.data_out = buffer;
+				work.data_len = buffer_size;
+				work.error = ASTCENC_SUCCESS;
+
+				double start_compression_time = get_time();
+				for (unsigned int i = 0; i < cli_config.repeat_count; i++)
+				{
+					if (config.progress_callback)
+					{
+						printf("Compression\n");
+						printf("===========\n");
+						printf("\n");
+					}
+
+					double start_iter_time = get_time();
+					if (cli_config.thread_count > 1)
+					{
+						launch_threads("Compression", cli_config.thread_count, compression_workload_runner, &work);
+					}
+					else
+					{
+						work.error = astcenc_compress_image(
+							work.context, work.image, &work.swizzle,
+							work.data_out, work.data_len, 0);
+					}
+
+					astcenc_compress_reset(codec_context);
+
+					if (config.progress_callback)
+					{
+						printf("\n\n");
+					}
+
+					double iter_time = get_time() - start_iter_time;
+					best_compression_time = astc::min(iter_time, best_compression_time);
+				}
+				total_compression_time += get_time() - start_compression_time;
+
+				if (work.error != ASTCENC_SUCCESS)
+				{
+					print_error("ERROR: Codec compress failed: %s\n", astcenc_get_error_string(work.error));
+					delete[] buffer;
+					return 1;
+				}
+			}
+
+			astc_compressed_image comp;
+			comp.block_x = config.block_x;
+			comp.block_y = config.block_y;
+			comp.block_z = config.block_z;
+			comp.dim_x = mip_img->dim_x;
+			comp.dim_y = mip_img->dim_y;
+			comp.dim_z = mip_img->dim_z;
+			comp.data = buffer;
+			comp.data_len = buffer_size;
+			mip_compressed.push_back(comp);
+
+			// Generate guide file for this level if requested
+			if (!cli_config.guide_out_filename.empty())
+			{
+				std::string guide_path = cli_config.guide_out_filename;
+				if (cli_config.generate_mipmaps)
+				{
+					guide_path += "." + std::to_string(level);
+				}
+
+				size_t guide_len = 0;
+				astcenc_error err = astcenc_generate_guide(
+					codec_context, mip_img, buffer, buffer_size, nullptr, &guide_len);
+				if (err != ASTCENC_SUCCESS)
+				{
+					print_error("ERROR: Guide generation failed: %s\n", astcenc_get_error_string(err));
+					return 1;
+				}
+
+				uint8_t* guide_data = new uint8_t[guide_len];
+				err = astcenc_generate_guide(
+					codec_context, mip_img, buffer, buffer_size, guide_data, &guide_len);
+				if (err != ASTCENC_SUCCESS)
+				{
+					print_error("ERROR: Guide generation failed: %s\n", astcenc_get_error_string(err));
+					delete[] guide_data;
+					return 1;
+				}
+
+				FILE* gf = fopen(guide_path.c_str(), "wb");
+				if (!gf)
+				{
+					print_error("ERROR: Failed to open guide output file '%s'\n",
+					            guide_path.c_str());
+					delete[] guide_data;
+					return 1;
+				}
+
+				size_t written = fwrite(guide_data, 1, guide_len, gf);
+				fclose(gf);
+				delete[] guide_data;
+
+				if (written != guide_len)
+				{
+					print_error("ERROR: Failed to write guide file '%s'\n",
+					            guide_path.c_str());
+					return 1;
+				}
+
+				if (!cli_config.silentmode)
+				{
+					printf("Guide file: %zu bytes written to '%s'\n",
+					       guide_len, guide_path.c_str());
+				}
 			}
 		}
 
-		image_comp.block_x = config.block_x;
-		image_comp.block_y = config.block_y;
-		image_comp.block_z = config.block_z;
-		image_comp.dim_x = image_uncomp_in->dim_x;
-		image_comp.dim_y = image_uncomp_in->dim_y;
-		image_comp.dim_z = image_uncomp_in->dim_z;
-		image_comp.data = buffer;
-		image_comp.data_len = buffer_size;
-
-		// Generate guide file if requested
-		if (!cli_config.guide_out_filename.empty())
+		if (!cli_config.silentmode && cli_config.generate_mipmaps)
 		{
-			// Compute required guide size
-			size_t guide_len = 0;
-			astcenc_error err = astcenc_generate_guide(
-				codec_context, image_uncomp_in, buffer, buffer_size, nullptr, &guide_len);
-			if (err != ASTCENC_SUCCESS)
-			{
-				print_error("ERROR: Guide generation failed: %s\n", astcenc_get_error_string(err));
-				return 1;
-			}
-
-			uint8_t* guide_data = new uint8_t[guide_len];
-			err = astcenc_generate_guide(
-				codec_context, image_uncomp_in, buffer, buffer_size, guide_data, &guide_len);
-			if (err != ASTCENC_SUCCESS)
-			{
-				print_error("ERROR: Guide generation failed: %s\n", astcenc_get_error_string(err));
-				delete[] guide_data;
-				return 1;
-			}
-
-			FILE* guide_file = fopen(cli_config.guide_out_filename.c_str(), "wb");
-			if (!guide_file)
-			{
-				print_error("ERROR: Failed to open guide output file '%s'\n",
-				            cli_config.guide_out_filename.c_str());
-				delete[] guide_data;
-				return 1;
-			}
-
-			size_t written = fwrite(guide_data, 1, guide_len, guide_file);
-			fclose(guide_file);
-			delete[] guide_data;
-
-			if (written != guide_len)
-			{
-				print_error("ERROR: Failed to write guide file '%s'\n",
-				            cli_config.guide_out_filename.c_str());
-				return 1;
-			}
-
-			if (!cli_config.silentmode)
-			{
-				printf("Guide file: %zu bytes written to '%s'\n\n",
-				       guide_len, cli_config.guide_out_filename.c_str());
-			}
+			printf("\n");
 		}
+
+		// Set image_comp to level 0 for backward compat with decompress/compare paths
+		image_comp = mip_compressed[0];
+		total_compression_time = get_time() - start_total_time;
 	}
 
 	// Decompress an image
@@ -2512,7 +2587,18 @@ int astcenc_main(
 		else if (ends_with(output_filename, ".ktx"))
 		{
 			bool srgb = profile == ASTCENC_PRF_LDR_SRGB;
-			error = store_ktx_compressed_image(image_comp, output_filename.c_str(), srgb, cli_config.y_flip);
+			if (cli_config.generate_mipmaps && mip_compressed.size() > 1)
+			{
+				error = store_ktx_compressed_image(
+					mip_compressed.data(),
+					static_cast<unsigned int>(mip_compressed.size()),
+					output_filename.c_str(), srgb, cli_config.y_flip);
+			}
+			else
+			{
+				error = store_ktx_compressed_image(
+					image_comp, output_filename.c_str(), srgb, cli_config.y_flip);
+			}
 			if (error)
 			{
 				print_error("ERROR: Failed to store compressed image\n");
@@ -2550,11 +2636,28 @@ int astcenc_main(
 		print_diagnostic_images(codec_context, image_comp, output_filename);
 	}
 
+	// Free generated mip images (not level 0, which is image_uncomp_in)
+	for (size_t i = 1; i < mip_images.size(); i++)
+	{
+		free_image(mip_images[i]);
+	}
+
 	free_image(image_uncomp_in);
 	free_image(image_decomp_out);
 	astcenc_context_free(codec_context);
 
-	delete[] image_comp.data;
+	// Free compressed mip data (level 0 data == image_comp.data, avoid double free)
+	if (mip_compressed.size() > 1)
+	{
+		for (size_t i = 0; i < mip_compressed.size(); i++)
+		{
+			delete[] mip_compressed[i].data;
+		}
+	}
+	else
+	{
+		delete[] image_comp.data;
+	}
 
 	if ((operation & ASTCENC_STAGE_COMPARE) || (!cli_config.silentmode))
 	{

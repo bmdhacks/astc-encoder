@@ -375,3 +375,128 @@ uint8_t* unorm8x4_array_from_astc_img(
 
 	return buf;
 }
+
+/* See header for documentation. */
+astcenc_image* generate_mipmap_image(
+	const astcenc_image* src
+) {
+	unsigned int src_x = src->dim_x;
+	unsigned int src_y = src->dim_y;
+	unsigned int dst_x = astc::max(1u, src_x / 2);
+	unsigned int dst_y = astc::max(1u, src_y / 2);
+
+	unsigned int bitness = 8;
+	if (src->data_type == ASTCENC_TYPE_F16)
+	{
+		bitness = 16;
+	}
+	else if (src->data_type == ASTCENC_TYPE_F32)
+	{
+		bitness = 32;
+	}
+
+	astcenc_image* dst = alloc_image(bitness, dst_x, dst_y, 1);
+
+	if (src->data_type == ASTCENC_TYPE_U8)
+	{
+		const uint8_t* src_data = static_cast<const uint8_t*>(src->data[0]);
+		uint8_t* dst_data = static_cast<uint8_t*>(dst->data[0]);
+
+		for (unsigned int oy = 0; oy < dst_y; oy++)
+		{
+			unsigned int sy0 = astc::min(2 * oy, src_y - 1);
+			unsigned int sy1 = astc::min(2 * oy + 1, src_y - 1);
+
+			for (unsigned int ox = 0; ox < dst_x; ox++)
+			{
+				unsigned int sx0 = astc::min(2 * ox, src_x - 1);
+				unsigned int sx1 = astc::min(2 * ox + 1, src_x - 1);
+
+				for (unsigned int c = 0; c < 4; c++)
+				{
+					unsigned int s00 = src_data[(sy0 * src_x + sx0) * 4 + c];
+					unsigned int s10 = src_data[(sy0 * src_x + sx1) * 4 + c];
+					unsigned int s01 = src_data[(sy1 * src_x + sx0) * 4 + c];
+					unsigned int s11 = src_data[(sy1 * src_x + sx1) * 4 + c];
+					dst_data[(oy * dst_x + ox) * 4 + c] = static_cast<uint8_t>((s00 + s10 + s01 + s11 + 2) / 4);
+				}
+			}
+		}
+	}
+	else if (src->data_type == ASTCENC_TYPE_F16)
+	{
+		const uint16_t* src_data = static_cast<const uint16_t*>(src->data[0]);
+		uint16_t* dst_data = static_cast<uint16_t*>(dst->data[0]);
+
+		for (unsigned int oy = 0; oy < dst_y; oy++)
+		{
+			unsigned int sy0 = astc::min(2 * oy, src_y - 1);
+			unsigned int sy1 = astc::min(2 * oy + 1, src_y - 1);
+
+			for (unsigned int ox = 0; ox < dst_x; ox++)
+			{
+				unsigned int sx0 = astc::min(2 * ox, src_x - 1);
+				unsigned int sx1 = astc::min(2 * ox + 1, src_x - 1);
+
+				vint4 p00(
+					src_data[(sy0 * src_x + sx0) * 4    ],
+					src_data[(sy0 * src_x + sx0) * 4 + 1],
+					src_data[(sy0 * src_x + sx0) * 4 + 2],
+					src_data[(sy0 * src_x + sx0) * 4 + 3]);
+				vint4 p10(
+					src_data[(sy0 * src_x + sx1) * 4    ],
+					src_data[(sy0 * src_x + sx1) * 4 + 1],
+					src_data[(sy0 * src_x + sx1) * 4 + 2],
+					src_data[(sy0 * src_x + sx1) * 4 + 3]);
+				vint4 p01(
+					src_data[(sy1 * src_x + sx0) * 4    ],
+					src_data[(sy1 * src_x + sx0) * 4 + 1],
+					src_data[(sy1 * src_x + sx0) * 4 + 2],
+					src_data[(sy1 * src_x + sx0) * 4 + 3]);
+				vint4 p11(
+					src_data[(sy1 * src_x + sx1) * 4    ],
+					src_data[(sy1 * src_x + sx1) * 4 + 1],
+					src_data[(sy1 * src_x + sx1) * 4 + 2],
+					src_data[(sy1 * src_x + sx1) * 4 + 3]);
+
+				vfloat4 avg = (float16_to_float(p00) + float16_to_float(p10)
+				             + float16_to_float(p01) + float16_to_float(p11)) * 0.25f;
+				vint4 result = float_to_float16(avg);
+
+				dst_data[(oy * dst_x + ox) * 4    ] = static_cast<uint16_t>(result.lane<0>());
+				dst_data[(oy * dst_x + ox) * 4 + 1] = static_cast<uint16_t>(result.lane<1>());
+				dst_data[(oy * dst_x + ox) * 4 + 2] = static_cast<uint16_t>(result.lane<2>());
+				dst_data[(oy * dst_x + ox) * 4 + 3] = static_cast<uint16_t>(result.lane<3>());
+			}
+		}
+	}
+	else // ASTCENC_TYPE_F32
+	{
+		assert(src->data_type == ASTCENC_TYPE_F32);
+		const float* src_data = static_cast<const float*>(src->data[0]);
+		float* dst_data = static_cast<float*>(dst->data[0]);
+
+		for (unsigned int oy = 0; oy < dst_y; oy++)
+		{
+			unsigned int sy0 = astc::min(2 * oy, src_y - 1);
+			unsigned int sy1 = astc::min(2 * oy + 1, src_y - 1);
+
+			for (unsigned int ox = 0; ox < dst_x; ox++)
+			{
+				unsigned int sx0 = astc::min(2 * ox, src_x - 1);
+				unsigned int sx1 = astc::min(2 * ox + 1, src_x - 1);
+
+				for (unsigned int c = 0; c < 4; c++)
+				{
+					float s00 = src_data[(sy0 * src_x + sx0) * 4 + c];
+					float s10 = src_data[(sy0 * src_x + sx1) * 4 + c];
+					float s01 = src_data[(sy1 * src_x + sx0) * 4 + c];
+					float s11 = src_data[(sy1 * src_x + sx1) * 4 + c];
+					dst_data[(oy * dst_x + ox) * 4 + c] = (s00 + s10 + s01 + s11) * 0.25f;
+				}
+			}
+		}
+	}
+
+	return dst;
+}
